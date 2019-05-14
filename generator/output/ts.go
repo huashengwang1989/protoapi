@@ -3,6 +3,7 @@ package output
 import (
 	"bytes"
 	"fmt"
+	"reflect"
 	"strings"
 	"text/template"
 
@@ -135,11 +136,91 @@ func (g *tsGen) getTpl(path string) *template.Template {
 }
 
 /**
+* Shallow copy struct with reflect
+ */
+func CopyStruct(src, dst interface{}) {
+	sval := reflect.ValueOf(src).Elem()
+	dval := reflect.ValueOf(dst).Elem()
+
+	for i := 0; i < sval.NumField(); i++ {
+		value := sval.Field(i)
+		name := sval.Type().Field(i).Name
+
+		dvalue := dval.FieldByName(name)
+		if dvalue.IsValid() == false {
+			continue
+		}
+		dvalue.Set(value) //这里默认共同成员的类型一样，否则这个地方可能导致 panic，需要简单修改一下。
+	}
+}
+
+/**
 * load CONTENT into TEMPLATE
  */
-func (g *tsGen) genContent(tpl *template.Template, data tsStruct) string {
+func (g *tsGen) genContent(tpl *template.Template, dataMap tsStruct, includeErrorTypesAsKind bool) string {
 	buf := bytes.NewBufferString("")
-	err := tpl.Execute(buf, data)
+
+	/*
+		dataMap {
+			ClassName: 'Trans' etc.
+			DataTypes: []{
+				Name: proto message names, e.g. 'CommonError', 'Person' etc.
+				Label: 'LABEL_OPTIONAL', 'LABEL_REPEATED' etc.
+				Fields: []{
+					Name: property keys, usually same as Key
+					key: property keys, e.g. 'userid', 'name' etc.
+					DataType: 'string', 'bool, 'int64' etc.
+					Options: map[string]string
+				}
+				...
+			}
+			...
+		}
+	*/
+
+	var tempData tsStruct
+
+	CopyStruct(&dataMap, &tempData)
+	tempData.DataTypes = make([]*data.MessageData, len(tempData.DataTypes))
+	if includeErrorTypesAsKind {
+		commonErrSubTypes := g.GetCommoneErrorFields()
+
+		for idx, dataType := range dataMap.DataTypes {
+			isErr := false
+			for _, errSubType := range commonErrSubTypes {
+				if dataType.Name == toTypeScriptType(errSubType.DataType) {
+					isErr = true
+					break
+				}
+			}
+			println("isErr: ", isErr)
+
+			if isErr {
+				var newDataType data.MessageData
+				CopyStruct(dataType, &newDataType)
+				newDataType.Fields = make([]*data.MessageField, len(dataType.Fields)+1)
+				for j, field := range dataType.Fields {
+					newDataType.Fields[j] = field
+				}
+				tsKindMessageField := &data.MessageField{
+					Name:     "kind",
+					DataType: "string",
+					Key:      "kind",
+					Label:    "LABEL_OPTIONAL",
+					Comment:  "",
+					Options:  data.OptionMap{},
+				}
+
+				newDataType.Fields[len(newDataType.Fields)-1] = tsKindMessageField
+
+				tempData.DataTypes[idx] = &newDataType
+			} else {
+				tempData.DataTypes[idx] = dataType
+			}
+		}
+	}
+
+	err := tpl.Execute(buf, tempData)
 	if err != nil {
 		panic(err)
 	}
@@ -150,13 +231,16 @@ func (g *tsGen) CommonError() string {
 	return g.service.Options["common_error"]
 }
 
+/*
+	@return '| GenericError | AuthError | ValidateError | BindError'
+*/
 func (g *tsGen) CommonErrorSubTypes() string {
 	var fieldTypes []string
 	for _, f := range g.GetCommoneErrorFields() {
 		subType := toTypeScriptType(f.DataType)
 		fieldTypes = append(fieldTypes, " | "+subType)
 	}
-
+	println("CommonErrorSubTypes: ", strings.Join(fieldTypes, ""))
 	return strings.Join(fieldTypes, "")
 }
 
@@ -197,7 +281,14 @@ func (g *tsGen) Init(request *plugin.CodeGeneratorRequest) {
 	g.loadTpl()
 }
 
-func (g *tsGen) Gen(applicationName string, packageName string, svrs []*data.ServiceData, messages []*data.MessageData, enums []*data.EnumData, options data.OptionMap) (map[string]string, error) {
+func (g *tsGen) Gen(
+	applicationName string,
+	packageName string,
+	svrs []*data.ServiceData,
+	messages []*data.MessageData,
+	enums []*data.EnumData,
+	options data.OptionMap,
+) (map[string]string, error) {
 	var svr *data.ServiceData
 	if len(svrs) > 1 {
 		util.Die(fmt.Errorf("found %d services; only 1 service is supported now", len(svrs)))
@@ -226,13 +317,13 @@ func (g *tsGen) Gen(applicationName string, packageName string, svrs []*data.Ser
 	var result = make(map[string]string)
 	switch g.Lib {
 	case tsLibAxios:
-		result[g.axiosFile] = g.genContent(g.axiosTpl, dataMap)
+		result[g.axiosFile] = g.genContent(g.axiosTpl, dataMap, false)
 	default:
-		result[g.fetchFile] = g.genContent(g.fetchTpl, dataMap)
+		result[g.fetchFile] = g.genContent(g.fetchTpl, dataMap, false)
 	}
 
-	result[g.objsFile] = g.genContent(g.objsTpl, dataMap)
-	result[g.helperFile] = g.genContent(g.helperTpl, dataMap)
+	result[g.objsFile] = g.genContent(g.objsTpl, dataMap, true)
+	result[g.helperFile] = g.genContent(g.helperTpl, dataMap, false)
 
 	return result, nil
 }
